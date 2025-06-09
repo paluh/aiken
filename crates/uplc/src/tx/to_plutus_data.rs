@@ -37,7 +37,7 @@ fn wrap_multiple_with_constr(index: u64, data: Vec<PlutusData>) -> PlutusData {
     })
 }
 
-fn wrap_with_constr(index: u64, data: PlutusData) -> PlutusData {
+pub fn wrap_with_constr(index: u64, data: PlutusData) -> PlutusData {
     wrap_multiple_with_constr(index, vec![data])
 }
 
