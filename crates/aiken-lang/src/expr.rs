@@ -9,17 +9,17 @@ pub(crate) use crate::{
     },
     parser::token::Base,
     tipo::{
-        ModuleValueConstructor, Type, TypeVar, ValueConstructor, ValueConstructorVariant,
         check_replaceable_opaque_type, convert_opaque_type, lookup_data_type_by_tipo,
+        ModuleValueConstructor, Type, TypeVar, ValueConstructor, ValueConstructorVariant,
     },
 };
 use indexmap::IndexMap;
 use pallas_primitives::alonzo::{Constr, PlutusData};
 use std::{fmt::Debug, ops::Deref, rc::Rc};
 use uplc::{
-    KeyValuePairs,
     ast::Data,
     machine::{runtime::convert_tag_to_constr, value::from_pallas_bigint},
+    KeyValuePairs,
 };
 use vec1::Vec1;
 
@@ -802,7 +802,9 @@ impl UntypedExpr {
                     return Self::reify_with(generics, data_types, t, tipo.clone(), with);
                 }
                 TypeVar::Generic { id } => {
+                    eprintln!("Handling generic variable");
                     if let Some(tipo) = generics.get(id) {
+                        eprintln!("Type found in generics: {tipo:?}");
                         return Self::reify_with(generics, data_types, t, tipo.clone(), with);
                     }
                 }
@@ -1054,6 +1056,7 @@ impl UntypedExpr {
                 any_constructor,
                 fields,
             }) => {
+                eprintln!("Entering reify const with tag {tag:?}");
                 let ix = convert_tag_to_constr(tag).or(any_constructor).unwrap() as usize;
 
                 let fields = fields
@@ -1121,6 +1124,8 @@ impl UntypedExpr {
                 }),
 
                 PlutusData::BoundedBytes(bytes) => {
+                    eprintln!("Reifying bounded bytes: {bytes:?}");
+                    eprintln!("Type is: {tipo:?}");
                     if tipo.is_string() {
                         Ok(UntypedExpr::String {
                             location: Span::empty(),
@@ -1214,6 +1219,8 @@ impl UntypedExpr {
                     any_constructor,
                     fields,
                 }) => {
+                    eprintln!("Entering reify constructor with tag {tag:?}");
+
                     let ix = convert_tag_to_constr(tag).or(any_constructor).unwrap() as usize;
 
                     if let Type::App { args, .. } = tipo.deref() {
@@ -1231,6 +1238,10 @@ impl UntypedExpr {
                             }
 
                             let constructor = &constructors[ix];
+                            eprintln!(
+                                "reifying constructor {constructor:?} with type {tipo:?} and fields: {fields:?}"
+                            );
+                            eprintln!("generics = {:#?}", generics);
 
                             typed_parameters
                                 .iter()
@@ -1242,6 +1253,39 @@ impl UntypedExpr {
                                         }
                                     }
                                 });
+
+                            // FIX:
+                            // // Build a fresh, local map for *this* ADT's own type-params
+                            // let mut local_generics = IndexMap::new();
+                            // for (param, arg_ty) in typed_parameters.iter().zip(args.iter()) {
+                            //     if let Some(gid) = param.get_generic() {
+                            //         // If the arg_ty is itself a Var, substitute one level via the outer map
+                            //         let concrete_ty = match arg_ty.as_ref() {
+                            //             Type::Var {
+                            //                 tipo: type_var_rc, ..
+                            //             } => {
+                            //                 let var_id =
+                            //                     type_var_rc.borrow().get_generic().unwrap();
+                            //                 generics
+                            //                     .get(&var_id) // outer lookup
+                            //                     .cloned()
+                            //                     .unwrap_or_else(|| arg_ty.clone())
+                            //             }
+                            //             other => Rc::new(other.clone()),
+                            //         };
+                            //         local_generics.insert(gid, concrete_ty);
+                            //     }
+                            // }
+
+                            // // Sanity‐check: we must have no naked Vars left
+                            // for (&gid, ty_rc) in &local_generics {
+                            //     if let Type::Var { .. } = ty_rc.as_ref() {
+                            //         return Err(format!(
+                            //             "unbound type variable {:?} in constructor {}: got {:?}",
+                            //             gid, constructor.name, ty_rc
+                            //         ));
+                            //     }
+                            // }
 
                             return if fields.is_empty() {
                                 Ok(UntypedExpr::Var {
@@ -1559,5 +1603,590 @@ impl UntypedExpr {
             .into(),
             return_annotation: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::well_known::OPTION_CONSTRUCTORS;
+    use crate::builtins;
+    use crate::utils;
+    use crate::IdGenerator;
+
+    use pallas_primitives::Int;
+    use pallas_primitives::MaybeIndefArray;
+    use uplc::tx::to_plutus_data::wrap_with_constr;
+    use uplc::tx::to_plutus_data::ToPlutusData;
+
+    fn mk_data_types() -> IndexMap<DataTypeKey, TypedDataType> {
+        // Load the prelude types
+        let id_gen = IdGenerator::new();
+        builtins::prelude_data_types(&id_gen)
+    }
+
+    #[test]
+    fn reify_int() {
+        let data_types = mk_data_types();
+        let data_types = utils::indexmap::as_ref_values(&data_types);
+
+        // Build a PlutusData::Int(42) value
+        let i: Int = 42.into();
+        let data: PlutusData = i.to_plutus_data();
+        // Create a compatible type
+        let tipo = Type::int();
+
+        let expr = UntypedExpr::reify_data(&data_types, data, tipo)
+            .expect("should reify int via reify_data");
+
+        let expected = UntypedExpr::UInt {
+            location: Span::empty(),
+            value: i.to_string(),
+            base: Base::Decimal {
+                numeric_underscore: false,
+            },
+        };
+
+        assert_eq!(expr, expected,);
+    }
+
+    #[test]
+    fn reify_fails_for_int_as_byte_array() {
+        let data_types = mk_data_types();
+        let data_types = utils::indexmap::as_ref_values(&data_types);
+
+        // Build a PlutusData::Int(42) value
+        let data: PlutusData = Int::from(42).to_plutus_data();
+
+        // Create a type that is not compatible with Int
+        let tipo = Type::byte_array();
+
+        // Run the reifier
+        let result = UntypedExpr::reify_data(&data_types, data, tipo);
+
+        // Expect failure
+        assert!(result.is_err(), "should fail to reify Int as ByteArray");
+    }
+
+    #[test]
+    fn reify_list_of_ints_via_reify_data() {
+        let data_types = mk_data_types();
+        let data_types = utils::indexmap::as_ref_values(&data_types);
+
+        // Build a PlutusData::Array [1,2]
+        let pd1 = Int::from(1).to_plutus_data();
+        let pd2 = Int::from(2).to_plutus_data();
+        let data = PlutusData::Array(MaybeIndefArray::Indef(vec![pd1, pd2]));
+
+        // 4) the Aiken type `List Int`
+        let tipo = Type::list(Type::int());
+
+        // 5) run the reifier
+        let actual = UntypedExpr::reify_data(&data_types, data, tipo)
+            .expect("should reify Array<Int> as List<Int>");
+
+        // 6) hand-build the expected `UntypedExpr::List`
+        let expected = UntypedExpr::List {
+            location: Span::empty(),
+            elements: vec![
+                UntypedExpr::UInt {
+                    location: Span::empty(),
+                    value: 1.to_string(),
+                    base: Base::Decimal {
+                        numeric_underscore: false,
+                    },
+                },
+                UntypedExpr::UInt {
+                    location: Span::empty(),
+                    value: 2.to_string(),
+                    base: Base::Decimal {
+                        numeric_underscore: false,
+                    },
+                },
+            ],
+            tail: None,
+        };
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn reify_option_int_via_reify_data() {
+        // 1) empty generics + prelude types
+        let id_gen = IdGenerator::new();
+        let data_types = builtins::prelude_data_types(&id_gen);
+        let data_types = utils::indexmap::as_ref_values(&data_types);
+
+        // 2) build PlutusData for `Some(3)`:
+        //    tag = 0 (Some), no any_constructor, fields = [ BigInt(3) ]
+        let three_pd = Int::from(3).to_plutus_data();
+        let data = wrap_with_constr(0, three_pd);
+
+        // 3) the Aiken type `Option Int`
+        let tipo = Type::option(Type::int());
+
+        // 4) reify
+        let actual =
+            UntypedExpr::reify_data(&data_types, data, tipo).expect("reify Some(3) as Option<Int>");
+
+        let some_tag = 0;
+        let some_name = OPTION_CONSTRUCTORS[some_tag].to_string();
+
+        // 5) hand-build the expected Call to `Some 3`
+        let expected = UntypedExpr::Call {
+            location: Span::empty(),
+            fun: Box::new(UntypedExpr::Var {
+                location: Span::empty(),
+                name: some_name.clone(),
+            }),
+            arguments: vec![CallArg {
+                label: None,
+                location: Span::empty(),
+                value: UntypedExpr::UInt {
+                    location: Span::empty(),
+                    value: 3.to_string(),
+                    base: Base::Decimal {
+                        numeric_underscore: false,
+                    },
+                },
+            }],
+        };
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn reify_tuple_option_int_option_bytearray() {
+        // 1) empty generics + prelude types
+        let id_gen = IdGenerator::new();
+        let data_types = builtins::prelude_data_types(&id_gen);
+        let data_types = utils::indexmap::as_ref_values(&data_types);
+
+        // 2) build the two PlutusData pieces:
+
+        //  - Some(7 : Int)
+        let pd_int = Int::from(7).to_plutus_data();
+        // here `wrap_with_constr(0, ...)` == Some(...)
+        let opt_int_pd = wrap_with_constr(0, pd_int);
+
+        //  - Some(#"DEADBEEF" : ByteArray)
+        let raw_bytes = vec![0xde, 0xad, 0xbe, 0xef];
+        let pd_bytes = Data::bytestring(raw_bytes.clone());
+        let opt_bytes_pd = wrap_with_constr(0, pd_bytes);
+
+        //  make the 2-tuple
+        let data = PlutusData::Array(MaybeIndefArray::Indef(vec![opt_int_pd, opt_bytes_pd]));
+
+        // 3) the Aiken type  (Option<Int>, Option<ByteArray>)
+        let tipo = Type::tuple(vec![
+            Type::option(Type::int()),
+            Type::option(Type::byte_array()),
+        ]);
+
+        // 4) run the reifier
+        let actual = UntypedExpr::reify_data(&data_types, data, tipo)
+            .expect("reify (Option<Int>,Option<ByteArray>)");
+
+        // 5) build the expected UPLC‐AST by hand:
+
+        // helper to get constructor names
+        let some = OPTION_CONSTRUCTORS[0].to_string(); // "Some"
+
+        let expected = UntypedExpr::Tuple {
+            location: Span::empty(),
+            elems: vec![
+                // Some 7
+                UntypedExpr::Call {
+                    location: Span::empty(),
+                    fun: Box::new(UntypedExpr::Var {
+                        location: Span::empty(),
+                        name: some.clone(),
+                    }),
+                    arguments: vec![CallArg {
+                        label: None,
+                        location: Span::empty(),
+                        value: UntypedExpr::UInt {
+                            location: Span::empty(),
+                            value: "7".to_string(),
+                            base: Base::Decimal {
+                                numeric_underscore: false,
+                            },
+                        },
+                    }],
+                },
+                // Some <bytes>
+                UntypedExpr::Call {
+                    location: Span::empty(),
+                    fun: Box::new(UntypedExpr::Var {
+                        location: Span::empty(),
+                        name: some.clone(),
+                    }),
+                    arguments: vec![CallArg {
+                        label: None,
+                        location: Span::empty(),
+                        value: UntypedExpr::ByteArray {
+                            location: Span::empty(),
+                            bytes: raw_bytes.iter().map(|&b| (b, Span::empty())).collect(),
+                            preferred_format: ByteArrayFormatPreference::HexadecimalString,
+                        },
+                    }],
+                },
+            ],
+        };
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn reify_tuple_option_int_option_int_with_bytestring_on_value_level() {
+        let id_gen = IdGenerator::new();
+        let data_types = builtins::prelude_data_types(&id_gen);
+        let data_types = utils::indexmap::as_ref_values(&data_types);
+
+        // Some(7 : Int) value
+        let pd_int = Int::from(7).to_plutus_data();
+        // here `wrap_with_constr(0, ...)` == Some(...)
+        let opt_int_pd = wrap_with_constr(0, pd_int);
+
+        // Some(#"DEADBEEF" : ByteArray) value
+        let raw_bytes = vec![0xde, 0xad, 0xbe, 0xef];
+        let pd_bytes = Data::bytestring(raw_bytes.clone());
+        let opt_bytes_pd = wrap_with_constr(0, pd_bytes);
+
+        // Make the 2-tuple of the two options
+        let data = PlutusData::Array(MaybeIndefArray::Indef(vec![opt_int_pd, opt_bytes_pd]));
+
+        // Create type (Option<Int>, Option<ByteArray>)
+        let tipo = Type::tuple(vec![Type::option(Type::int()), Type::option(Type::int())]);
+
+        // This should fail as the second element is a ByteArray, not an Int on the value level.
+        let result = UntypedExpr::reify_data(&data_types, data, tipo);
+        assert!(
+            result.is_err(),
+            "Expected a type‐mismatch error, but got Ok: {:?}",
+            result.ok()
+        );
+    }
+
+    #[test]
+    fn reify_option_option_int_via_reify_data() {
+        // 1) empty generics + prelude types
+        let id_gen = IdGenerator::new();
+        let dt_owned = builtins::prelude_data_types(&id_gen);
+        let data_types = utils::indexmap::as_ref_values(&dt_owned);
+
+        // 2) build PlutusData for `Some(Some(5))`:
+        //    inner = Some(5)
+        let pd5 = Int::from(5).to_plutus_data();
+        let inner_pd = wrap_with_constr(0, pd5);
+        //    outer = Some(inner)
+        let data = wrap_with_constr(0, inner_pd.clone());
+
+        // 3) the Aiken type `Option<Option<Int>>`
+        let tipo = Type::option(Type::option(Type::int()));
+
+        // 4) run the reifier
+        let actual = UntypedExpr::reify_data(&data_types, data, tipo)
+            .expect("reify Some(Some(5)) as Option<Option<Int>>");
+
+        // 5) hand-build the expected nested Calls:
+        let some_name = OPTION_CONSTRUCTORS[0].to_string(); // "Some"
+
+        // inner call: Some 5
+        let inner_expr = UntypedExpr::Call {
+            location: Span::empty(),
+            fun: Box::new(UntypedExpr::Var {
+                location: Span::empty(),
+                name: some_name.clone(),
+            }),
+            arguments: vec![CallArg {
+                label: None,
+                location: Span::empty(),
+                value: UntypedExpr::UInt {
+                    location: Span::empty(),
+                    value: "5".to_string(),
+                    base: Base::Decimal {
+                        numeric_underscore: false,
+                    },
+                },
+            }],
+        };
+
+        // outer call: Some inner_expr
+        let expected = UntypedExpr::Call {
+            location: Span::empty(),
+            fun: Box::new(UntypedExpr::Var {
+                location: Span::empty(),
+                name: some_name,
+            }),
+            arguments: vec![CallArg {
+                label: None,
+                location: Span::empty(),
+                value: inner_expr,
+            }],
+        };
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn reify_option_option_option_int_via_reify_data() {
+        // 1) empty generics + prelude types
+        let id_gen = IdGenerator::new();
+        let dt_owned = builtins::prelude_data_types(&id_gen);
+        let data_types = utils::indexmap::as_ref_values(&dt_owned);
+
+        // 2) build PlutusData for `Some(Some(Some(9)))`:
+        let pd9 = Int::from(9).to_plutus_data();
+        let inner_pd = wrap_with_constr(0, pd9); // Some(9)
+        let middle_pd = wrap_with_constr(0, inner_pd.clone()); // Some(Some(9))
+        let outer_data = wrap_with_constr(0, middle_pd.clone()); // Some(Some(Some(9)))
+
+        // 3) the Aiken type `Option<Option<Option<Int>>>`
+        let tipo = Type::option(Type::option(Type::option(Type::int())));
+
+        // 4) run the reifier
+        let actual = UntypedExpr::reify_data(&data_types, outer_data, tipo)
+            .expect("reify Some(Some(Some(9))) as Option<Option<Option<Int>>>");
+
+        // 5) hand-build the expected nested Calls:
+        let some = OPTION_CONSTRUCTORS[0].to_string(); // "Some"
+
+        // innermost: Some 9
+        let inner_expr = UntypedExpr::Call {
+            location: Span::empty(),
+            fun: Box::new(UntypedExpr::Var {
+                location: Span::empty(),
+                name: some.clone(),
+            }),
+            arguments: vec![CallArg {
+                label: None,
+                location: Span::empty(),
+                value: UntypedExpr::UInt {
+                    location: Span::empty(),
+                    value: "9".to_string(),
+                    base: Base::Decimal {
+                        numeric_underscore: false,
+                    },
+                },
+            }],
+        };
+
+        // middle: Some(inner_expr)
+        let middle_expr = UntypedExpr::Call {
+            location: Span::empty(),
+            fun: Box::new(UntypedExpr::Var {
+                location: Span::empty(),
+                name: some.clone(),
+            }),
+            arguments: vec![CallArg {
+                label: None,
+                location: Span::empty(),
+                value: inner_expr,
+            }],
+        };
+
+        // outer: Some(middle_expr)
+        let expected = UntypedExpr::Call {
+            location: Span::empty(),
+            fun: Box::new(UntypedExpr::Var {
+                location: Span::empty(),
+                name: some,
+            }),
+            arguments: vec![CallArg {
+                label: None,
+                location: Span::empty(),
+                value: middle_expr,
+            }],
+        };
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn reify_option_option_int_and_option_int_via_reify_data() {
+        // 1) empty generics + prelude
+        let id_gen = IdGenerator::new();
+        let data_types = builtins::prelude_data_types(&id_gen);
+        let data_types = utils::indexmap::as_ref_values(&data_types);
+
+        // 2) build value (Some(Some(1)), Some(2))
+        let pd1 = Int::from(1).to_plutus_data();
+        let inner = wrap_with_constr(0, pd1);
+        let first = wrap_with_constr(0, inner);
+        let pd2 = Int::from(2).to_plutus_data();
+        let second = wrap_with_constr(0, pd2);
+        let data = PlutusData::Array(MaybeIndefArray::Indef(vec![first, second]));
+
+        // 3) the Aiken type (Option<Option<Int>>, Option<Int>)
+        let tipo = Type::tuple(vec![
+            Type::option(Type::option(Type::int())),
+            Type::option(Type::int()),
+        ]);
+
+        // 4) on the *old* buggy code this should Err
+        let result = UntypedExpr::reify_data(&data_types, data, tipo);
+
+        let actual = result.expect("fixed reifier should succeed");
+        // helper to get the constructor name
+        let some = OPTION_CONSTRUCTORS[0].to_string(); // "Some"
+
+        // innermost call: Some(1)
+        let inner1 = UntypedExpr::Call {
+            location: Span::empty(),
+            fun: Box::new(UntypedExpr::Var {
+                location: Span::empty(),
+                name: some.clone(),
+            }),
+            arguments: vec![CallArg {
+                label: None,
+                location: Span::empty(),
+                value: UntypedExpr::UInt {
+                    location: Span::empty(),
+                    value: "1".to_string(),
+                    base: Base::Decimal {
+                        numeric_underscore: false,
+                    },
+                },
+            }],
+        };
+
+        // next layer: Some(inner1)
+        let nested = UntypedExpr::Call {
+            location: Span::empty(),
+            fun: Box::new(UntypedExpr::Var {
+                location: Span::empty(),
+                name: some.clone(),
+            }),
+            arguments: vec![CallArg {
+                label: None,
+                location: Span::empty(),
+                value: inner1,
+            }],
+        };
+
+        // second tuple element: Some(2)
+        let second = UntypedExpr::Call {
+            location: Span::empty(),
+            fun: Box::new(UntypedExpr::Var {
+                location: Span::empty(),
+                name: some,
+            }),
+            arguments: vec![CallArg {
+                label: None,
+                location: Span::empty(),
+                value: UntypedExpr::UInt {
+                    location: Span::empty(),
+                    value: "2".to_string(),
+                    base: Base::Decimal {
+                        numeric_underscore: false,
+                    },
+                },
+            }],
+        };
+
+        // the full tuple:
+        let expected = UntypedExpr::Tuple {
+            location: Span::empty(),
+            elems: vec![nested, second],
+        };
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn reify_option_bytearray_and_option_tuple_int_via_reify_data() {
+        let id_gen = IdGenerator::new();
+        let data_types = builtins::prelude_data_types(&id_gen);
+        let data_types = utils::indexmap::as_ref_values(&data_types);
+
+        // 2a) Some(#"00" : ByteArray)
+        let raw = vec![0x00];
+        let pd_bytes = Data::bytestring(raw.clone());
+        let opt_ba_pd = wrap_with_constr(0, pd_bytes);
+
+        // 2b) Some((8,8) : (Int,Int))
+        let pd8 = Int::from(8).to_plutus_data();
+        let tuple_pd = PlutusData::Array(MaybeIndefArray::Indef(vec![pd8.clone(), pd8.clone()]));
+        let opt_tup_pd = wrap_with_constr(0, tuple_pd);
+
+        // 2c) top‐level array = [ Some(#"00"), Some((8,8)) ]
+        let data = PlutusData::Array(MaybeIndefArray::Indef(vec![opt_ba_pd, opt_tup_pd]));
+
+        // 3) the Aiken type (Option<ByteArray>, Option<(Int,Int)>)
+        let tipo = Type::tuple(vec![
+            Type::option(Type::byte_array()),
+            Type::option(Type::tuple(vec![Type::int(), Type::int()])),
+        ]);
+
+        // 4) run reifier
+        let actual = UntypedExpr::reify_data(&data_types, data, tipo)
+            .expect("reify (Option<ByteArray>,Option<(Int,Int)>)");
+
+        // 5) hand‐build expected AST
+
+        let some = OPTION_CONSTRUCTORS[0].to_string(); // "Some"
+
+        // element 1: Some(#"00")
+        let ba_call = UntypedExpr::Call {
+            location: Span::empty(),
+            fun: Box::new(UntypedExpr::Var {
+                location: Span::empty(),
+                name: some.clone(),
+            }),
+            arguments: vec![CallArg {
+                label: None,
+                location: Span::empty(),
+                value: UntypedExpr::ByteArray {
+                    location: Span::empty(),
+                    bytes: raw.iter().map(|&b| (b, Span::empty())).collect(),
+                    preferred_format: ByteArrayFormatPreference::HexadecimalString,
+                },
+            }],
+        };
+
+        // element 2: Some((8,8))
+        let tuple_call = {
+            // inner tuple expression
+            let tup_expr = UntypedExpr::Tuple {
+                location: Span::empty(),
+                elems: vec![
+                    UntypedExpr::UInt {
+                        location: Span::empty(),
+                        value: "8".into(),
+                        base: Base::Decimal {
+                            numeric_underscore: false,
+                        },
+                    },
+                    UntypedExpr::UInt {
+                        location: Span::empty(),
+                        value: "8".into(),
+                        base: Base::Decimal {
+                            numeric_underscore: false,
+                        },
+                    },
+                ],
+            };
+            // wrap it in Some
+            UntypedExpr::Call {
+                location: Span::empty(),
+                fun: Box::new(UntypedExpr::Var {
+                    location: Span::empty(),
+                    name: some.clone(),
+                }),
+                arguments: vec![CallArg {
+                    label: None,
+                    location: Span::empty(),
+                    value: tup_expr,
+                }],
+            }
+        };
+
+        // full tuple:
+        let expected = UntypedExpr::Tuple {
+            location: Span::empty(),
+            elems: vec![ba_call, tuple_call],
+        };
+
+        assert_eq!(actual, expected);
     }
 }
