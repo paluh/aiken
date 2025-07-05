@@ -1222,28 +1222,38 @@ impl UntypedExpr {
                                 });
                             }
 
+                            // Invariant:
+                            // * Generics is a map which points to concrete types.
+                            // Proof:
+                            // * case_0: We should start with a map to concrete types - reification
+                            // expects fully instantiated types.
+                            // * case_n+1: provided generics from case_n point directly to
+                            // concrete types. When processing the type params we are resolving them
+                            // against the previous map doing a lookup over unresolved vars which should
+                            // result in a concrete type. The new generics preserve the invariant.
                             let local_generics: IndexMap<u64, Rc<Type>> = typed_parameters
                                 .iter()
-                                .zip(args)
+                                .zip(args.iter())
                                 .filter_map(|(param, arg_ty)| {
-                                    param.get_generic().map(|gid| {
-                                        let concrete_ty = match arg_ty.as_ref() {
-                                            Type::Var {
-                                                tipo: type_var_rc, ..
-                                            } => {
-                                                let var_id =
-                                                    type_var_rc.borrow().get_generic().unwrap();
-                                                generics
-                                                    .get(&var_id)
-                                                    .cloned()
-                                                    .unwrap_or_else(|| arg_ty.clone())
-                                            }
-                                            _ => arg_ty.clone(),
-                                        };
-                                        (gid, concrete_ty)
-                                    })
+                                    param.get_generic().map(|gid| (gid, arg_ty))
                                 })
-                                .collect();
+                                .map(|(gid, arg_ty)| {
+                                    let concrete_ty = match arg_ty.as_ref() {
+                                        Type::Var {
+                                            tipo: type_var_rc, ..
+                                        } => {
+                                            let var_id =
+                                                type_var_rc.borrow().get_generic().unwrap();
+                                            generics.get(&var_id).cloned().ok_or_else(|| {
+                                                format!("Generic type not found: {var_id:?}")
+                                            })?
+                                        }
+                                        _ => arg_ty.clone(),
+                                    };
+
+                                    Ok((gid, concrete_ty))
+                                })
+                                .collect::<Result<IndexMap<_, _>, String>>()?;
 
                             let constructor = &constructors[ix];
                             return if fields.is_empty() {
@@ -2016,15 +2026,16 @@ mod tests {
 
         // Plutus: 8
         let eight_pd = Int::from(8).to_plutus_data();
-        //  Plutus: [8,8]
+        let nine_pd = Int::from(9).to_plutus_data();
+        //  Plutus: [8,9]
         let tuple_pd = PlutusData::Array(MaybeIndefArray::Indef(vec![
             eight_pd.clone(),
-            eight_pd.clone(),
+            nine_pd.clone(),
         ]));
         let opt_tuple_pd = wrap_with_constr(0, tuple_pd);
 
-        // Plutus: [ Some(#"00"), Some((8,8)) ]
-        let data = PlutusData::Array(MaybeIndefArray::Indef(vec![opt_ba_pd, opt_tup_pd]));
+        // Plutus: [ Some(#"00"), Some((8,9)) ]
+        let data = PlutusData::Array(MaybeIndefArray::Indef(vec![opt_ba_pd, opt_tuple_pd]));
 
         // (Option<ByteArray>, Option<(Int,Int)>)
         let tipo = Type::tuple(vec![
