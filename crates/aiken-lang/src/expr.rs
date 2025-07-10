@@ -1239,14 +1239,29 @@ impl UntypedExpr {
                                 })
                                 .map(|(gid, arg_ty)| {
                                     let concrete_ty = match arg_ty.as_ref() {
+
                                         Type::Var {
-                                            tipo: type_var_rc, ..
+                                            tipo: var_tipo, ..
                                         } => {
-                                            let var_id =
-                                                type_var_rc.borrow().get_generic().unwrap();
-                                            generics.get(&var_id).cloned().ok_or_else(|| {
-                                                format!("Generic type not found: {var_id:?}")
-                                            })?
+                                            match &*var_tipo.borrow() {
+                                                TypeVar::Link { tipo } => tipo.clone(),
+                                                TypeVar::Generic { id } => {
+                                                    if let Some(concrete_ty) = generics.get(id) {
+                                                        concrete_ty.clone()
+                                                    } else {
+                                                        return Err(format!(
+                                                            "generic type {} not found in generics map",
+                                                            id
+                                                        ));
+                                                    }
+                                                },
+                                                TypeVar::Unbound { .. } => {
+                                                    return Err(format!(
+                                                        "unbound type variable {} in type annotation {tipo:?}",
+                                                        gid
+                                                    ));
+                                                }
+                                            }
                                         }
                                         _ => arg_ty.clone(),
                                     };
@@ -1746,7 +1761,7 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    #[test]
+    // #[test]
     // FIXME: Those should be enabled together with some fixes
     // // Aiken type: `Int` should fail on a value: `(Some(1), Some(""))`
     // fn reify_fails_for_int_as_bytearray() {
